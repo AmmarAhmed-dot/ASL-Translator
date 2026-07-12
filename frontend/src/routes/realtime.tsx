@@ -8,7 +8,11 @@ import { AppShell } from "@/components/app-shell";
 import { GlassCard, PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 
-const BACKEND_URL = "http://127.0.0.1:5000";
+import pkg from "@mediapipe/hands";
+import type { Results } from "@mediapipe/hands";
+const { Hands } = pkg;
+
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? "http://127.0.0.1:5000";
 
 export const Route = createFileRoute("/realtime")({
   component: RealtimeCamera,
@@ -44,8 +48,30 @@ function RealtimeCamera() {
   const [confidence,  setConfidence]  = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  // Stop stream on unmount
-  useEffect(() => () => stopCamera(), []);
+  const handsRef = useRef<Hands | null>(null);
+
+  // Initialize MediaPipe Hands on mount and stop stream on unmount
+  useEffect(() => {
+    const hands = new Hands({
+      locateFile: (file) => {
+        return `/mediapipe/hands/${file}`;
+      }
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+
+    handsRef.current = hands;
+
+    return () => {
+      stopCamera();
+      hands.close();
+    };
+  }, []);
 
   // ── TTS ────────────────────────────────────────────────────────────────────
   const speakText = (text: string) => {
@@ -161,13 +187,128 @@ function RealtimeCamera() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    // Convert to base64 data URL (JPEG 95%)
-    const base64Image = canvas.toDataURL("image/jpeg", 0.95);
-
     try {
       setIsAnalyzing(true);
-      setPrediction("Analyzing Sign Matrix...");
+      setPrediction("Detecting Hand...");
       clearOverlay();
+
+      // Run MediaPipe to find the hand
+      const detectHand = (): Promise<Results> => {
+        return new Promise((resolve) => {
+          if (!handsRef.current) return resolve({ multiHandLandmarks: [], multiHandedness: [], image: canvas } as unknown as Results);
+          handsRef.current.onResults((results) => resolve(results));
+          handsRef.current.send({ image: canvas });
+        });
+      };
+
+      const results = await detectHand();
+
+      if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+         setPrediction("No Hand Detected");
+         setConfidence(0);
+         return;
+      }
+
+      setPrediction("Analyzing Sign Matrix...");
+
+      // Compute bounding box
+      const landmarks = results.multiHandLandmarks[0];
+      const xCoords = landmarks.map((l) => l.x);
+      const yCoords = landmarks.map((l) => l.y);
+      let minX = Math.min(...xCoords);
+      let maxX = Math.max(...xCoords);
+      let minY = Math.min(...yCoords);
+      let maxY = Math.max(...yCoords);
+
+      // Add 20% padding
+      const width = maxX - minX;
+      const height = maxY - minY;
+      const paddingX = width * 0.2;
+      const paddingY = height * 0.2;
+
+      minX = minX - paddingX;
+      maxX = maxX + paddingX;
+      minY = minY - paddingY;
+      maxY = maxY + paddingY;
+
+      // Convert to pixel coordinates
+      const pxMinX = minX * canvas.width;
+      const pxMaxX = maxX * canvas.width;
+      const pxMinY = minY * canvas.height;
+      const pxMaxY = maxY * canvas.height;
+      
+      const pxWidth = pxMaxX - pxMinX;
+      const pxHeight = pxMaxY - pxMinY;
+
+      // FORCE SQUARE CROP
+      // The backend resizes to 224x224. If we send a rectangle (e.g. for letter 'I'), 
+      // the hand gets squished and the AI gets confused.
+      const size = Math.max(pxWidth, pxHeight);
+      const centerX = pxMinX + pxWidth / 2;
+      const centerY = pxMinY + pxHeight / 2;
+
+      const squareMinX = centerX - size / 2;
+      const squareMinY = centerY - size / 2;
+
+      // Create cropped canvas
+      // Compute edge-average fill color from the hand bounding box region
+      // so padding blends naturally instead of confusing the model with black/white
+      const safeMinX = Math.max(0, Math.floor(pxMinX));
+      const safeMinY = Math.max(0, Math.floor(pxMinY));
+      const safeMaxX = Math.min(canvas.width, Math.ceil(pxMaxX));
+      const safeMaxY = Math.min(canvas.height, Math.ceil(pxMaxY));
+      const edgePixels = ctx.getImageData(safeMinX, safeMinY, safeMaxX - safeMinX, safeMaxY - safeMinY);
+      let rSum = 0, gSum = 0, bSum = 0, count = 0;
+      const edgeW = safeMaxX - safeMinX;
+      const edgeH = safeMaxY - safeMinY;
+      for (let i = 0; i < edgeW; i++) {
+        // top row
+        const tIdx = i * 4;
+        rSum += edgePixels.data[tIdx]; gSum += edgePixels.data[tIdx+1]; bSum += edgePixels.data[tIdx+2]; count++;
+        // bottom row
+        const bIdx = ((edgeH - 1) * edgeW + i) * 4;
+        rSum += edgePixels.data[bIdx]; gSum += edgePixels.data[bIdx+1]; bSum += edgePixels.data[bIdx+2]; count++;
+      }
+      for (let j = 0; j < edgeH; j++) {
+        // left column
+        const lIdx = (j * edgeW) * 4;
+        rSum += edgePixels.data[lIdx]; gSum += edgePixels.data[lIdx+1]; bSum += edgePixels.data[lIdx+2]; count++;
+        // right column
+        const rIdx = (j * edgeW + edgeW - 1) * 4;
+        rSum += edgePixels.data[rIdx]; gSum += edgePixels.data[rIdx+1]; bSum += edgePixels.data[rIdx+2]; count++;
+      }
+      const avgR = Math.round(rSum / count);
+      const avgG = Math.round(gSum / count);
+      const avgB = Math.round(bSum / count);
+
+      const cropCanvas = document.createElement("canvas");
+      cropCanvas.width = size;
+      cropCanvas.height = size;
+      const cropCtx = cropCanvas.getContext("2d");
+      if (!cropCtx) return;
+
+      // Fill with edge-average color so padding blends with the scene
+      cropCtx.fillStyle = `rgb(${avgR},${avgG},${avgB})`;
+      cropCtx.fillRect(0, 0, size, size);
+
+      cropCtx.drawImage(
+        canvas,
+        squareMinX, squareMinY, size, size,
+        0, 0, size, size
+      );
+
+      // Store the computed bounding box for drawing the overlay
+      const handBbox = {
+        detected: true,
+        x: Math.max(0, pxMinX),
+        y: Math.max(0, pxMinY),
+        w: pxWidth,
+        h: pxHeight
+      };
+
+      // Use PNG (lossless) instead of JPEG to prevent compression artifacts
+      // that destroy model predictions
+      const base64Image = cropCanvas.toDataURL("image/png");
 
       // Convert the base64 image to a Blob
       const fetchResponse = await fetch(base64Image);
@@ -175,7 +316,8 @@ function RealtimeCamera() {
       
       // Send as multipart/form-data
       const formData = new FormData();
-      formData.append("image", blob, "realtime_capture.jpg");
+      formData.append("image", blob, "realtime_capture.png");
+      formData.append("landmarks", JSON.stringify(landmarks));
 
       const response = await axiosInstance.post<PredictRealtimeResponse>(
         `${BACKEND_URL}/predict_realtime`,
@@ -209,19 +351,11 @@ function RealtimeCamera() {
       setConfidence(conf);
       speakText(label);
 
-      // Draw bounding box if available
-      if (data.bbox && data.bbox.length === 4) {
-        drawHandBoundingBox(
-          {
-            detected: true,
-            x: data.bbox[0],
-            y: data.bbox[1],
-            w: data.bbox[2],
-            h: data.bbox[3]
-          },
-          `${label} (${Math.round(conf)}%)`
-        );
-      }
+      // Draw bounding box
+      drawHandBoundingBox(
+        handBbox,
+        `${label} (${Math.round(conf)}%)`
+      );
 
       // Firestore log
       const user = auth.currentUser;
